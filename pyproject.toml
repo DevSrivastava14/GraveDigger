@@ -7,7 +7,7 @@ name = "gravedigger"
 version = "0.1.0"
 description = "Dig up the files your repo buried."
 requires-python = ">=3.11"
-dependencies = ["click>=8.1", "ollama>=0.3", "jinja2>=3.1", "rich>=13"]
+dependencies = ["click>=8.1", "ollama>=0.6", "jinja2>=3.1", "rich>=13"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
