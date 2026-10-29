@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from gravedigger.exhume import Death, find_deaths, NotARepositoryError, GitNotFoundError
+from gravedigger.exhume import Death, Grave, find_deaths, enrich, NotARepositoryError, GitNotFoundError
 
 
 @pytest.fixture
@@ -176,3 +176,129 @@ class TestFindDeaths:
         assert len(deaths) == 2
         assert deaths[0].path == "b.txt"
         assert deaths[1].path == "a.txt"
+
+
+class TestEnrich:
+    """Tests for enrich function."""
+
+    def test_plain_file_born_died_lifespan_correct(self, git_repo: Path):
+        """(a) Born/died dates and lifespan_days correct for a plain file."""
+        _commit(git_repo, "Add file", "2024-01-10T12:00:00+00:00", ("plain.txt", "content"))
+        _commit_delete(git_repo, "Delete file", "2024-01-20T12:00:00+00:00", "plain.txt")
+
+        deaths = find_deaths(git_repo)
+        graves, skipped = enrich(git_repo, deaths)
+
+        assert skipped == 0
+        assert len(graves) == 1
+        g = graves[0]
+        assert g.path == "plain.txt"
+        assert g.born_date == datetime(2024, 1, 10, 12, 0, 0, tzinfo=timezone.utc)
+        assert g.death_date == datetime(2024, 1, 20, 12, 0, 0, tzinfo=timezone.utc)
+        assert g.lifespan_days == 10
+
+    def test_deleted_recreated_deleted_second_birth(self, git_repo: Path):
+        """(b) File deleted, recreated, deleted again has the SECOND birth."""
+        _commit(git_repo, "Add v1", "2024-01-10T12:00:00+00:00", ("cycle.txt", "v1"))
+        _commit_delete(git_repo, "First delete", "2024-01-15T12:00:00+00:00", "cycle.txt")
+        _commit(git_repo, "Recreate v2", "2024-01-16T12:00:00+00:00", ("cycle.txt", "v2"))
+        _commit_delete(git_repo, "Final delete", "2024-01-20T12:00:00+00:00", "cycle.txt")
+
+        deaths = find_deaths(git_repo)
+        graves, skipped = enrich(git_repo, deaths)
+
+        assert skipped == 0
+        assert len(graves) == 1
+        g = graves[0]
+        assert g.path == "cycle.txt"
+        # Birth should be the recreate commit (2024-01-16), not the original (2024-01-10)
+        assert g.born_date == datetime(2024, 1, 16, 12, 0, 0, tzinfo=timezone.utc)
+        assert g.lifespan_days == 4
+
+    def test_born_by_rename(self, git_repo: Path):
+        """(c) File born by rename has the rename commit as its birth."""
+        _commit(git_repo, "Add old", "2024-01-10T12:00:00+00:00", ("old.txt", "content"))
+        # Rename via git mv (delete old + add new in same commit)
+        env = os.environ.copy()
+        env["GIT_AUTHOR_DATE"] = "2024-01-15T12:00:00+00:00"
+        env["GIT_COMMITTER_DATE"] = "2024-01-15T12:00:00+00:00"
+        (git_repo / "old.txt").unlink()
+        (git_repo / "new.txt").write_text("content")
+        subprocess.run(["git", "add", "-A"], cwd=git_repo, check=True, capture_output=True, env=env)
+        subprocess.run(["git", "commit", "-m", "Rename old to new"], cwd=git_repo, check=True, capture_output=True, env=env)
+        _commit_delete(git_repo, "Delete new", "2024-01-20T12:00:00+00:00", "new.txt")
+
+        deaths = find_deaths(git_repo)
+        graves, skipped = enrich(git_repo, deaths)
+
+        assert skipped == 0
+        assert len(graves) == 1
+        g = graves[0]
+        assert g.path == "new.txt"
+        # Birth should be the rename commit (2024-01-15), not the original add (2024-01-10)
+        assert g.born_date == datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+        assert g.born_message == "Rename old to new"
+
+    def test_last_snippet_before_deletion(self, git_repo: Path):
+        """(d) last_snippet is content before deletion, not empty and not from deleting commit."""
+        _commit(git_repo, "Add file", "2024-01-10T12:00:00+00:00", ("snippet.txt", "line1\nline2\nline3"))
+        _commit_delete(git_repo, "Delete file", "2024-01-20T12:00:00+00:00", "snippet.txt")
+
+        deaths = find_deaths(git_repo)
+        graves, skipped = enrich(git_repo, deaths)
+
+        assert skipped == 0
+        assert len(graves) == 1
+        g = graves[0]
+        assert g.lines_at_death == 3
+        assert "line1" in g.last_snippet
+        assert "line2" in g.last_snippet
+        assert "line3" in g.last_snippet
+        assert g.last_snippet != ""
+
+    def test_binary_file_skipped(self, git_repo: Path):
+        """(e) Binary file is skipped and counted."""
+        # Create a file with NUL byte
+        _commit(git_repo, "Add binary", "2024-01-10T12:00:00+00:00", ("binary.dat", "hello\x00world"))
+        _commit_delete(git_repo, "Delete binary", "2024-01-20T12:00:00+00:00", "binary.dat")
+
+        deaths = find_deaths(git_repo)
+        graves, skipped = enrich(git_repo, deaths)
+
+        assert skipped == 1
+        assert len(graves) == 0
+
+    def test_older_bigger_outranks_younger_smaller(self, git_repo: Path):
+        """(f) Older, bigger file outranks younger, smaller one by notability."""
+        # Old file, many lines, long lifespan
+        _commit(git_repo, "Add big", "2024-01-01T12:00:00+00:00", ("big.txt", "\n".join([f"line{i}" for i in range(100)])))
+        _commit_delete(git_repo, "Delete big", "2024-01-30T12:00:00+00:00", "big.txt")
+        # Young file, few lines, short lifespan
+        _commit(git_repo, "Add small", "2024-01-28T12:00:00+00:00", ("small.txt", "only one line"))
+        _commit_delete(git_repo, "Delete small", "2024-01-29T12:00:00+00:00", "small.txt")
+
+        deaths = find_deaths(git_repo)
+        graves, skipped = enrich(git_repo, deaths)
+
+        assert skipped == 0
+        assert len(graves) == 2
+        # big.txt should have higher notability (29 days * log1p(100) ≈ 29*4.6 ≈ 133)
+        # vs small.txt (1 day * log1p(1) ≈ 0.7)
+        assert graves[0].path == "big.txt"
+        assert graves[0].notability > graves[1].notability
+
+    def test_same_timestamp_birth_death(self, git_repo: Path):
+        """(g) File whose birth and death have same timestamp still finds correct birth."""
+        # Same timestamp for birth and death
+        _commit(git_repo, "Add and delete same day", "2024-01-15T12:00:00+00:00", ("same_day.txt", "content"))
+        _commit_delete(git_repo, "Delete same day", "2024-01-15T12:00:00+00:00", "same_day.txt")
+
+        deaths = find_deaths(git_repo)
+        graves, skipped = enrich(git_repo, deaths)
+
+        assert skipped == 0
+        assert len(graves) == 1
+        g = graves[0]
+        assert g.path == "same_day.txt"
+        assert g.born_date == g.death_date
+        assert g.lifespan_days == 0
