@@ -10,6 +10,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Iterable
 
 
 # Noise filters: easily editable constants at module top
@@ -25,8 +26,20 @@ NOISE_PATH_PREFIXES = (
     "dist/", "build/", ".github/",
 )
 
-# Notability multiplier for code/documentation files
+# Notability multiplier for Python files only
 NOTABILITY_CODE_BONUS = 1.5
+
+# Diversity cap: max graves per top-level directory
+MAX_PER_DIRECTORY = 3
+
+# Mass grave threshold: merge N+ deaths in same commit
+MASS_GRAVE_MIN = 5
+
+# Founder bonus: files born within FOUNDER_WINDOW_DAYS of the repo's
+# first commit get FOUNDER_BONUS multiplier. The first files of a
+# repo are its ancestors, whatever their lifespan.
+FOUNDER_WINDOW_DAYS = 30
+FOUNDER_BONUS = 3.0
 
 
 @dataclass(frozen=True)
@@ -55,6 +68,8 @@ class Grave:
     lines_at_death: int
     last_snippet: str
     notability: float
+    members: tuple[str, ...] = ()
+    is_mass: bool = False
 
 
 class NotARepositoryError(Exception):
@@ -109,6 +124,18 @@ def _run_git_bytes(args: list[str], repo_path: Path) -> bytes:
         raise RuntimeError(f"git failed: {stderr}")
 
     return result.stdout
+
+
+def _get_root_commit_date(repo_path: Path) -> datetime:
+    """Return the author date of the repo's earliest commit (root)."""
+    out = _run_git([
+        "log", "--max-parents=0", "--format=%aI",
+    ], repo_path)
+    # Take the earliest if multiple roots
+    dates = [line.strip() for line in out.splitlines() if line.strip()]
+    if not dates:
+        raise RuntimeError("no root commit found")
+    return min(datetime.fromisoformat(d) for d in dates)
 
 
 def find_deaths(repo_path: Path) -> list[Death]:
@@ -171,21 +198,175 @@ def find_deaths(repo_path: Path) -> list[Death]:
     return sorted(deaths_by_path.values(), key=lambda d: d.death_date, reverse=True)
 
 
-def calculate_notability(lifespan_days: int, lines_at_death: int, is_code: bool) -> float:
+def calculate_notability(lifespan_days: int, lines_at_death: int, is_python: bool, is_founder: bool = False) -> float:
     """Calculate notability score.
 
     Uses log1p(lines) so that a huge file doesn't dominate purely by size.
     A 1000-line file gets ~6.9x the base, a 100-line file gets ~4.6x,
     a 10-line file gets ~2.4x. The log compresses the range while still
-    rewarding larger files. Code files (.py, .rst, .md) get a 1.5x bonus.
+    rewarding larger files. Python files (.py) get a 1.5x bonus.
+    Founder files (born within FOUNDER_WINDOW_DAYS of the root commit)
+    get a FOUNDER_BONUS multiplier because they are the repo's ancestors.
     """
     score = lifespan_days * math.log1p(lines_at_death)
-    if is_code:
+    if is_python:
         score *= NOTABILITY_CODE_BONUS
+    if is_founder:
+        score *= FOUNDER_BONUS
     return score
 
 
-def enrich(repo_path: Path, deaths: list[Death]) -> tuple[list[Grave], int]:
+def _top_level_group(path: str) -> str:
+    """Return the cap group key for a path.
+
+    - Paths containing '/' are grouped by their top-level directory (before first '/')
+    - Top-level files (no '/') each get their own unique group (the full path)
+    Git paths always use '/', even on Windows.
+    """
+    if '/' in path:
+        return path.split('/')[0]
+    return path  # unique group per top-level file
+
+
+def _mass_grave_cap_group(path: str, members: tuple[str, ...]) -> str:
+    """Return the cap group for a mass grave.
+
+    If members share a common top-level directory, use that.
+    Otherwise, the mass grave is its own group.
+    """
+    # Check if all members share the same top-level directory
+    top_dirs = {m.split('/')[0] for m in members if '/' in m}
+    if len(top_dirs) == 1:
+        return top_dirs.pop()
+    return path  # own group
+
+
+def _deepest_common_dir(paths: Iterable[str]) -> str:
+    """Return the deepest common directory of all paths, or '' if none."""
+    paths_list = list(paths)
+    if not paths_list:
+        return ''
+    # Split into components
+    split_paths = [p.split('/') for p in paths_list]
+    # Find common prefix
+    common = []
+    for components in zip(*split_paths):
+        if len(set(components)) == 1:
+            common.append(components[0])
+        else:
+            break
+    if not common:
+        return ''
+    return '/'.join(common)
+
+
+def _merge_mass_graves(graves: list[Grave]) -> list[Grave]:
+    """Merge graves with same death_commit if count >= MASS_GRAVE_MIN.
+
+    Returns new list with mass graves merged.
+    """
+    # Group by death_commit
+    by_commit: dict[str, list[Grave]] = {}
+    for g in graves:
+        by_commit.setdefault(g.death_commit, []).append(g)
+
+    result: list[Grave] = []
+    for commit, group in by_commit.items():
+        if len(group) >= MASS_GRAVE_MIN:
+            # Create mass grave
+            # Most notable member provides born_* and snippet
+            best = max(group, key=lambda g: g.notability)
+            members = tuple(sorted(g.path for g in group))
+            common_dir = _deepest_common_dir(members)
+            if common_dir:
+                mass_path = f"{common_dir}/ ({len(members)} files)"
+            else:
+                # Truncate death message to 70 chars
+                msg = best.death_message[:70]
+                mass_path = f"{len(members)} files killed by: {msg}"
+            # Cap group for mass grave
+            cap_group = _mass_grave_cap_group(mass_path, members)
+            # Use max lifespan, max notability
+            max_lifespan = max(g.lifespan_days for g in group)
+            max_notability = max(g.notability for g in group)
+
+            result.append(Grave(
+                path=mass_path,
+                death_commit=commit,
+                death_date=best.death_date,
+                killer=best.killer,
+                death_message=best.death_message,
+                born_commit=best.born_commit,
+                born_date=best.born_date,
+                born_message=best.born_message,
+                born_by=best.born_by,
+                lifespan_days=max_lifespan,
+                lines_at_death=best.lines_at_death,
+                last_snippet=best.last_snippet,
+                notability=max_notability,
+                members=members,
+                is_mass=True,
+            ))
+        else:
+            result.extend(group)
+    return result
+
+
+def _apply_diversity_cap(graves: list[Grave]) -> list[Grave]:
+    """Apply MAX_PER_DIRECTORY cap per top-level directory.
+
+    Walks graves in notability order, keeps at most MAX_PER_DIRECTORY per group.
+    Returns (kept, removed) where removed are the excess graves in notability order.
+    """
+    counts: dict[str, int] = {}
+    kept: list[Grave] = []
+    removed: list[Grave] = []
+
+    for g in graves:
+        if g.is_mass:
+            group = _mass_grave_cap_group(g.path, g.members)
+        else:
+            group = _top_level_group(g.path)
+        if counts.get(group, 0) < MAX_PER_DIRECTORY:
+            kept.append(g)
+            counts[group] = counts.get(group, 0) + 1
+        else:
+            removed.append(g)
+
+    return kept, removed
+
+
+def exhume(repo_path: Path, limit: int = 30) -> list[Grave]:
+    """Full pipeline: find deaths -> enrich -> mass-grave merge -> cap -> backfill -> limit.
+
+    Returns top `limit` graves.
+    """
+    repo_path = Path(repo_path).resolve()
+
+    # Get root commit date for founder bonus
+    root_date = _get_root_commit_date(repo_path)
+
+    deaths = find_deaths(repo_path)
+    graves, _ = enrich(repo_path, deaths, root_date)
+
+    # Mass grave merge (before cap)
+    graves = _merge_mass_graves(graves)
+    # Sort by notability after merge
+    graves.sort(key=lambda g: g.notability, reverse=True)
+
+    # Apply diversity cap
+    kept, removed = _apply_diversity_cap(graves)
+
+    # Backfill: if fewer than limit kept, fill from removed (highest notability first)
+    # This ensures we return `limit` graves whenever enough exist.
+    if len(kept) < limit:
+        need = limit - len(kept)
+        kept.extend(removed[:need])
+
+    return kept[:limit]
+
+
+def enrich(repo_path: Path, deaths: list[Death], root_date: datetime | None = None) -> tuple[list[Grave], int]:
     """Enrich Death records into Graves with birth info and last content.
 
     Returns (graves, skipped_count) where skipped includes:
@@ -301,8 +482,9 @@ def enrich(repo_path: Path, deaths: list[Death]) -> tuple[list[Grave], int]:
         if lifespan_days < 0:
             lifespan_days = 0
 
-        is_code = path.endswith((".py", ".rst", ".md"))
-        notability = calculate_notability(lifespan_days, lines_at_death, is_code)
+        is_python = path.endswith(".py")
+        is_founder = root_date is not None and (born_date - root_date).days <= FOUNDER_WINDOW_DAYS
+        notability = calculate_notability(lifespan_days, lines_at_death, is_python, is_founder)
 
         graves.append(Grave(
             path=path,

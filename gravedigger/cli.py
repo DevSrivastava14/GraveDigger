@@ -3,27 +3,35 @@ import click
 import time
 from pathlib import Path
 
-from gravedigger.exhume import find_deaths, enrich
+from gravedigger.exhume import exhume
+from gravedigger.export import graves_to_json
 
 
 @click.command()
 @click.argument("repo_path", type=click.Path(exists=True, file_okay=False))
 @click.option("-o", "--output", default="graveyard.html", help="Output HTML file.")
-def main(repo_path: str, output: str) -> None:
+@click.option("--json", "json_path", type=click.Path(), help="Write graves as JSON to this file.")
+@click.option("--limit", default=30, help="Number of graves to return.")
+def main(repo_path: str, output: str, json_path: str | None, limit: int) -> None:
     """Dig up the files your repo buried."""
     repo = Path(repo_path)
-    deaths = find_deaths(repo)
-    click.echo(f"Found {len(deaths)} deaths")
 
     start = time.perf_counter()
-    graves, skipped = enrich(repo, deaths)
+    graves = exhume(repo, limit=limit)
     elapsed = time.perf_counter() - start
 
-    click.echo(f"Enriched into {len(graves)} graves ({skipped} skipped) in {elapsed:.2f}s")
-    click.echo("Top 10 by notability:")
-    for g in graves[:10]:
-        click.echo(f"  {g.notability:.1f}  {g.lifespan_days}d  {g.lines_at_death} lines  {g.path}")
-    click.echo(f"Output would go to {output} (not implemented yet)")
+    click.echo(f"Exhumed {len(graves)} graves in {elapsed:.2f}s")
+    click.echo("Top graves by notability:")
+    for i, g in enumerate(graves, 1):
+        mass_flag = " [MASS]" if g.is_mass else ""
+        click.echo(f"  {i:2d}. {g.notability:.1f}  {g.lifespan_days}d  {g.lines_at_death} lines  {g.path}{mass_flag}")
+
+    if json_path:
+        json_str = graves_to_json(graves)
+        Path(json_path).write_text(json_str, encoding="utf-8")
+        click.echo(f"Wrote JSON to {json_path}")
+
+    click.echo(f"HTML output would go to {output} (not implemented yet)")
 
 
 if __name__ == "__main__":
