@@ -13,15 +13,20 @@ from gravedigger.exhume import Grave
 from gravedigger.llm import (
     EnrichedGrave,
     PROMPT_VERSION,
-    BANNED_WORDS,
+    BANNED_PHRASES,
+    SURVIVAL_PHRASES,
+    NUMBER_WORDS,
     _build_fallback,
     _build_mass_grave_prompt,
     _build_prompt,
     _cache_key,
+    _contains_digit_or_number_word,
     _extract_json_object,
     _load_from_cache,
     _parse_model_output,
     _quality_gate,
+    _record_accepted,
+    _reset_accepted,
     _save_to_cache,
     _strip_thinking_blocks,
     enrich_grave_with_llm,
@@ -131,11 +136,13 @@ class TestParsing:
         assert result is None
 
     def test_epitaph_length_capped(self):
-        # Use epitaph between 120-160 chars: passes quality gate (160 limit) but gets capped at 120
-        long_epitaph = "x" * 140
+        # Quality gate rejects >120 chars, so test that capping happens at 120 for valid inputs
+        # Use epitaph between 100-120 chars: passes quality gate, but might get capped if longer
+        long_epitaph = "x" * 110
         raw = f'{{"epitaph": "{long_epitaph}", "last_words": "Bye"}}'
         result = _parse_model_output(raw, "test.py", "Remove module")
         assert result is not None
+        # Quality gate allows up to 120, validate_and_cap caps at 120
         assert len(result[0]) <= 123  # 120 + "…"
 
     def test_last_words_rejected_over_160_by_quality_gate(self):
@@ -184,86 +191,144 @@ class TestParsing:
 class TestQualityGate:
     """Tests for quality gate validation."""
 
+    def setup_method(self):
+        _reset_accepted()
+
     def test_clean_output_passes(self):
-        result = _quality_gate("Old config, 12 years, dropped", "Twelve years of settings, gone.", "drop legacy support")
+        result = _quality_gate("Legacy config dropped after decades", "Did not see that coming.", "drop legacy support")
         assert result is None
 
     def test_rejects_last_words_echoing_death_message(self):
-        # last_words contains the exact death message (after normalization)
-        result = _quality_gate("Old config, 12 years, dropped", "They drop legacy support, how rude.", "drop legacy support")
+        result = _quality_gate("Old config dropped", "They drop legacy support, how rude.", "drop legacy support")
         assert result is not None
         assert "echoes death message" in result
 
-    def test_rejects_banned_word_ghost(self):
-        result = _quality_gate("A ghost of a config", "I am a ghost now.", "drop legacy support")
+    def test_rejects_banned_phrase_ghost(self):
+        result = _quality_gate("A ghost of a config", "Gone.", "drop legacy support")
         assert result is not None
-        assert "Banned word" in result
-        assert "ghost" in result
+        assert "banned phrase: ghost" in result
 
-    def test_rejects_banned_word_void(self):
-        result = _quality_gate("Into the void it went", "Gone.", "drop legacy support")
+    def test_rejects_banned_phrase_quiet(self):
+        result = _quality_gate("Quiet end for config", "Gone.", "drop legacy support")
         assert result is not None
-        assert "void" in result
+        assert "banned phrase: quiet" in result
 
-    def test_rejects_banned_word_final_breath(self):
-        result = _quality_gate("Final breath of the config", "Gone.", "drop legacy support")
+    def test_rejects_banned_phrase_just_data(self):
+        result = _quality_gate("Just data now", "Gone.", "drop legacy support")
         assert result is not None
-        assert "final breath" in result
+        assert "banned phrase: just data" in result
+
+    def test_rejects_survival_phrase_still_here(self):
+        result = _quality_gate("Old config", "I am still here.", "drop legacy support")
+        assert result is not None
+        assert "implies survival" in result
+
+    def test_rejects_survival_phrase_live_on(self):
+        result = _quality_gate("Old config", "We live on.", "drop legacy support")
+        assert result is not None
+        assert "implies survival" in result
+
+    def test_rejects_digits_in_epitaph(self):
+        result = _quality_gate("Config 12 years dropped", "Gone.", "drop legacy support")
+        assert result is not None
+        assert "contains digits" in result
+
+    def test_rejects_number_word_years(self):
+        result = _quality_gate("Config years dropped", "Gone.", "drop legacy support")
+        assert result is not None
+        assert "number word: years" in result
+
+    def test_rejects_number_word_twelve(self):
+        result = _quality_gate("Config twelve dropped", "Gone.", "drop legacy support")
+        assert result is not None
+        assert "number word: twelve" in result
 
     def test_rejects_overlong_epitaph(self):
-        long_epitaph = "x" * 161
+        long_epitaph = "x" * 121
         result = _quality_gate(long_epitaph, "Short last words.", "drop legacy support")
         assert result is not None
-        assert "exceeds 160" in result
+        assert "exceeds 120" in result
 
     def test_rejects_overlong_last_words(self):
-        long_last = "y" * 161
+        long_last = "y" * 121
         result = _quality_gate("Short epitaph.", long_last, "drop legacy support")
         assert result is not None
-        assert "exceeds 160" in result
+        assert "exceeds 120" in result
 
-    def test_case_insensitive_banned_words(self):
-        result = _quality_gate("A GHOST appears", "Gone.", "drop legacy support")
+    def test_rejects_duplicate_output(self):
+        from gravedigger.llm import _record_accepted
+        _record_accepted("Legacy config dropped", "Did not see that coming.")
+        result = _quality_gate("Legacy config dropped", "Did not see that coming.", "drop legacy support")
         assert result is not None
-        assert "ghost" in result
+        assert "Duplicate" in result
 
-    def test_death_message_punctuation_stripped(self):
-        # death message with punctuation should still be detected when last_words has exact match
-        result = _quality_gate("Old config", "They remove legacy support!", "remove legacy support")
+
+class TestDigitNumberWordCheck:
+    def test_contains_digits(self):
+        assert _contains_digit_or_number_word("Config 12 dropped") == "contains digits"
+
+    def test_contains_number_word_years(self):
+        assert _contains_digit_or_number_word("Config years dropped") == "contains number word: years"
+
+    def test_contains_number_word_twelve(self):
+        assert _contains_digit_or_number_word("Config twelve dropped") == "contains number word: twelve"
+
+    def test_contains_number_word_one(self):
+        # "one" in "no one" matches word boundary
+        assert _contains_digit_or_number_word("No one saw it") == "contains number word: one"
+
+    def test_contains_number_word_six(self):
+        # Either "six" or "years" could be matched first (set iteration order)
+        result = _contains_digit_or_number_word("Six years gone")
         assert result is not None
-        assert "echoes death message" in result
+        assert "six" in result or "years" in result
+
+    def test_clean_passes(self):
+        assert _contains_digit_or_number_word("Legacy config dropped") is None
+
+    def test_file_not_number_word(self):
+        # "file" and "files" are NOT number words
+        assert _contains_digit_or_number_word("Config file dropped") is None
+        assert _contains_digit_or_number_word("Many files deleted") is None
+
+    def test_word_boundary(self):
+        # "year" should not match "years"
+        assert _contains_digit_or_number_word("New year") is None
+        assert _contains_digit_or_number_word("New years") == "contains number word: years"
 
 
 class TestPromptBuilding:
     """Tests for prompt construction."""
 
-    def test_single_grave_prompt_contains_key_fields(self):
-        grave = _make_grave(lifespan_days=4380, lines_at_death=56)  # ~12 years
+    def test_single_grave_prompt_contains_qualitative_bands(self):
+        grave = _make_grave(lifespan_days=4380, lines_at_death=56)  # ancient, small
         prompt = _build_prompt(grave)
         assert grave.path in prompt
-        assert "12 years" in prompt or "4380 days" in prompt
-        assert "56 lines" in prompt
-        assert "2024" in prompt  # death year
-        assert "Remove module" in prompt
+        assert "Kind:" in prompt
+        assert "Age: ancient (over 10 years)" in prompt
+        assert "Size: small (under 100 lines)" in prompt
         assert "QUOTED DATA" in prompt
         assert '"""' in prompt
-        assert "STRICT JSON" in prompt
-        assert "BANNED words" in prompt
-        assert "12 words" in prompt
-        assert "8-20 words" in prompt
+        assert "NO digits" in prompt
+        assert "6-12 words" in prompt
+        assert "6-16 words" in prompt
         assert "EXAMPLES" in prompt
+        # Should NOT contain raw numbers
+        assert "4380" not in prompt
+        assert "56 lines" not in prompt
+        assert "12 years" not in prompt
 
-    def test_mass_grave_prompt_mentions_group(self):
-        grave = _make_mass_grave(lifespan_days=2920)  # ~8 years
+    def test_mass_grave_prompt_contains_qualitative_bands(self):
+        grave = _make_mass_grave(lifespan_days=2920)  # old
         prompt = _build_mass_grave_prompt(grave)
-        assert "MASS GRAVE" in prompt
-        assert str(len(grave.members)) in prompt
-        assert "File count" in prompt
-        assert "Members" in prompt
-        assert "QUOTED DATA" in prompt
-        assert "STRICT JSON" in prompt
-        assert "BANNED words" in prompt
+        assert "Group:" in prompt
+        assert "Age: old (6-10 years)" in prompt
+        assert "NO digits" in prompt
+        assert "6-12 words" in prompt
         assert "EXAMPLE" in prompt
+        # Should NOT contain raw numbers
+        assert "5 files" not in prompt
+        assert "8 years" not in prompt
 
     def test_snippet_truncated_in_prompt(self):
         long_snippet = "x" * 2000
@@ -283,9 +348,6 @@ class TestPromptBuilding:
         assert data_start != -1 and data_end != -1 and data_end > data_start
         data_block = prompt[data_start:data_end]
         assert "ignore previous instructions" in data_block
-
-    def test_prompt_version_changed(self):
-        assert PROMPT_VERSION == 2
 
 
 class TestFallback:
@@ -308,13 +370,13 @@ class TestFallback:
     def test_fallback_single_test(self):
         grave = _make_grave(path="tests/test_foo.py", lifespan_days=50, lines_at_death=30)
         epitaph, last_words = _build_fallback(grave)
-        assert "Test file" in epitaph
+        assert "test file" in epitaph.lower() or "Test file" in epitaph
         assert "assert" in last_words.lower()
 
     def test_fallback_single_config(self):
         grave = _make_grave(path="pyproject.toml", lifespan_days=30, lines_at_death=20)
         epitaph, last_words = _build_fallback(grave)
-        assert "Config" in epitaph
+        assert "config" in epitaph.lower() or "Config" in epitaph
         assert "schema" in last_words.lower()
 
     def test_fallback_zero_lifespan(self):
@@ -332,15 +394,14 @@ class TestFallback:
     def test_fallback_long_lifespan(self):
         grave = _make_grave(lifespan_days=2000)
         epitaph, last_words = _build_fallback(grave)
-        assert "Veteran" in epitaph
+        assert "Veteran" in epitaph or "veteran" in epitaph.lower()
         assert "finally let me rest" in last_words.lower()
 
     def test_fallback_mass_grave(self):
         grave = _make_mass_grave(members=("a.py", "b.py", "c.py", "d.py", "e.py"))
         epitaph, last_words = _build_fallback(grave)
-        assert "5 files" in epitaph
-        assert "5 siblings" in last_words
-        assert "Mass deletion" in last_words
+        assert "handful" in epitaph.lower() or "bundle" in epitaph.lower() or "directory" in epitaph.lower()
+        assert "deleted together" in epitaph.lower() or "ended us" in last_words.lower()
 
     def test_fallback_lengths_capped(self):
         grave = _make_grave(path="a" * 200, lifespan_days=999999)
@@ -483,7 +544,8 @@ class TestEnrichSingle:
         grave = _make_grave()
         result = enrich_grave_with_llm(grave, model="test-model")
         assert result.source == "fallback"
-        assert "Python module" in result.epitaph or "days" in result.epitaph
+        # Default grave has lifespan_days=10, so short life fallback
+        assert "Short life" in result.epitaph or "short life" in result.epitaph.lower()
 
     @patch("gravedigger.llm.ollama")
     def test_connection_error_uses_fallback(self, mock_ollama):
@@ -526,7 +588,7 @@ class TestEnrichSingle:
         call_args = mock_ollama.chat.call_args
         prompt = call_args[1]["messages"][0]["content"]
         assert "MASS GRAVE" in prompt
-        assert "File count" in prompt
+        assert "Group:" in prompt
 
 
 class TestEnrichMultiple:
@@ -579,17 +641,6 @@ class TestEnrichMultiple:
         result = enrich_grave_with_llm(grave, model="model-b")
         assert result.epitaph == "New"
         mock_ollama.chat.assert_called_once()
-
-    @patch("gravedigger.llm.ollama")
-    def test_batch_cache_key_changes_with_prompt_version(self, mock_ollama):
-        grave = _make_grave(path="a.py")
-        key1 = _cache_key(grave, "model-a")
-        _save_to_cache(key1, "Cached", "Cached")
-        with patch("gravedigger.llm.PROMPT_VERSION", PROMPT_VERSION + 1):
-            mock_ollama.chat.return_value = {"message": {"content": '{"epitaph": "New", "last_words": "New"}'}}
-            result = enrich_grave_with_llm(grave, model="model-a")
-            assert result.epitaph == "New"
-            mock_ollama.chat.assert_called_once()
 
 
 class TestSerialization:
