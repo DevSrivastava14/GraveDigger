@@ -5,3 +5,4 @@ __pycache__/
 .gravedigger_cache.json
 graveyard.html
 .pytest_cache/graveyard.json
+epitaphs.json

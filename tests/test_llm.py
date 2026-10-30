@@ -604,3 +604,51 @@ class TestModelNameResolution:
         from gravedigger.llm import _get_model_name
         monkeypatch.delenv("GRAVEDIGGER_MODEL", raising=False)
         assert _get_model_name(None) == "qwen3.5:2b"
+
+
+class TestOllamaCallArguments:
+    """Tests that ollama.chat is called with correct arguments."""
+
+    def setup_method(self):
+        cache_dir = Path(".gravedigger_cache")
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
+
+    def teardown_method(self):
+        cache_dir = Path(".gravedigger_cache")
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
+
+    @patch("gravedigger.llm.ollama")
+    def test_chat_called_with_think_false_top_level(self, mock_ollama):
+        """Verify think=False is a top-level arg, not inside options."""
+        mock_ollama.chat.return_value = {
+            "message": {"content": '{"epitaph": "Test", "last_words": "Test"}'}
+        }
+        grave = _make_grave()
+        enrich_grave_with_llm(grave, model="test-model")
+
+        # Check the call arguments
+        call_kwargs = mock_ollama.chat.call_args.kwargs
+        assert call_kwargs.get("think") is False, "think=False must be top-level"
+        assert "options" in call_kwargs
+        options = call_kwargs["options"]
+        assert options.get("num_predict") == 200, "num_predict must be 200"
+        assert options.get("temperature") == 0.7, "temperature must be 0.7"
+        assert call_kwargs.get("keep_alive") == "30m", "keep_alive must be 30m"
+        # Ensure think is NOT in options
+        assert "think" not in options, "think must not be inside options"
+
+    @patch("gravedigger.llm.ollama")
+    def test_mass_grave_chat_arguments(self, mock_ollama):
+        """Same argument checks for mass grave."""
+        mock_ollama.chat.return_value = {
+            "message": {"content": '{"epitaph": "Mass", "last_words": "Mass"}'}
+        }
+        grave = _make_mass_grave()
+        enrich_grave_with_llm(grave, model="test-model")
+
+        call_kwargs = mock_ollama.chat.call_args.kwargs
+        assert call_kwargs.get("think") is False
+        assert call_kwargs.get("keep_alive") == "30m"
+        assert call_kwargs["options"].get("num_predict") == 200

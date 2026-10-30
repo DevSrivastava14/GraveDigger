@@ -6,12 +6,17 @@ so the pipeline never crashes on bad model output.
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import logging
 import os
 import re
+import sys
+import threading
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -338,21 +343,46 @@ def _save_to_cache(key: str, epitaph: str, last_words: str) -> None:
         pass
 
 
-def _call_ollama(prompt: str, model: str) -> str | None:
-    """Call Ollama chat API, return raw response or None on connection error."""
+def _call_ollama(prompt: str, model: str, timeout: float = 60.0) -> str | None:
+    """Call Ollama chat API with timeout, return raw response or None on error/timeout."""
     if ollama is None:
         return None
-    try:
-        response = ollama.chat(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            options={"think": False},  # think=False for hybrid reasoning models
-        )
-        return response.get("message", {}).get("content", "")
-    except Exception as e:
-        # Connection error or other - propagate as None for connection issues
-        _log.debug("Ollama call failed: %s", e)
+
+    result: dict[str, Any] = {"response": None, "error": None}
+
+    def target():
+        try:
+            response = ollama.chat(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                think=False,
+                options={"num_predict": 200, "temperature": 0.7},
+                keep_alive="30m",
+            )
+            result["response"] = response.get("message", {}).get("content", "")
+        except Exception as e:
+            result["error"] = e
+
+    thread = threading.Thread(target=target)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout=timeout)
+
+    if thread.is_alive():
+        # Timeout - thread is still running
+        _log.warning("Ollama call timed out after %.1fs for model %s", timeout, model)
         return None
+
+    if result["error"]:
+        _log.debug("Ollama call failed: %s", result["error"])
+        return None
+
+    return result["response"]
+
+
+def _call_ollama_no_timeout(prompt: str, model: str) -> str | None:
+    """Call Ollama chat API without timeout (for cache check etc.)."""
+    return _call_ollama(prompt, model, timeout=300.0)  # generous timeout for non-user-facing calls
 
 
 def enrich_grave_with_llm(grave: Grave, model: str | None = None) -> EnrichedGrave:
@@ -530,3 +560,137 @@ def enriched_graves_to_json(enriched: list[EnrichedGrave]) -> str:
             "source": g.source,
         })
     return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def _check_ollama_model(model: str) -> bool:
+    """Check if Ollama is reachable and the model exists."""
+    if ollama is None:
+        return False
+    try:
+        response = ollama.list()
+        models = response.get("models", [])
+        return any(m.get("name") == model or m.get("model") == model for m in models)
+    except Exception:
+        return False
+
+
+def _enrich_with_timeout(grave: Grave, model: str, timeout: float = 60.0) -> tuple[EnrichedGrave, float]:
+    """Enrich a single grave, returning (EnrichedGrave, elapsed_seconds).
+    
+    The per-call timeout is enforced inside _call_ollama via threading.
+    """
+    start = time.perf_counter()
+    enriched = enrich_grave_with_llm(grave, model=model)
+    elapsed = time.perf_counter() - start
+    return enriched, elapsed
+
+
+def main() -> int:
+    """Entry point: python -m gravedigger.llm graveyard.json -o epitaphs.json --limit N"""
+    parser = argparse.ArgumentParser(
+        description="Enrich graveyard.json with LLM-generated epitaphs and last words."
+    )
+    parser.add_argument("input", help="Path to graveyard.json")
+    parser.add_argument("-o", "--output", required=True, help="Output path for epitaphs.json")
+    parser.add_argument("--limit", type=int, default=0, help="Limit number of graves to process (0 = all)")
+    parser.add_argument("--model", help="Ollama model name (default: GRAVEDIGGER_MODEL env or qwen3.5:2b)")
+    args = parser.parse_args()
+
+    # Load graveyard.json
+    input_path = Path(args.input)
+    if not input_path.exists():
+        print(f"Error: Input file not found: {input_path}", file=sys.stderr)
+        return 1
+
+    try:
+        with input_path.open("r", encoding="utf-8") as f:
+            graves_data = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in {input_path}: {e}", file=sys.stderr)
+        return 1
+
+    # Convert to Grave objects
+    graves: list[Grave] = []
+    for g in graves_data:
+        graves.append(Grave(
+            path=g["path"],
+            death_commit=g["death_commit"],
+            death_date=datetime.fromisoformat(g["death_date"]),
+            killer=g["killer"],
+            death_message=g["death_message"],
+            born_commit=g["born_commit"],
+            born_date=datetime.fromisoformat(g["born_date"]),
+            born_message=g["born_message"],
+            born_by=g["born_by"],
+            lifespan_days=g["lifespan_days"],
+            lines_at_death=g["lines_at_death"],
+            last_snippet=g["last_snippet"],
+            notability=g["notability"],
+            members=tuple(g.get("members", [])),
+            is_mass=g.get("is_mass", False),
+        ))
+
+    if args.limit > 0:
+        graves = graves[:args.limit]
+
+    # Get model name
+    model = _get_model_name(args.model)
+
+    # Check Ollama and model before starting
+    if not _check_ollama_model(model):
+        print(f"Error: Ollama not reachable or model '{model}' not found.", file=sys.stderr)
+        print("Run 'ollama pull qwen3.5:2b' or set GRAVEDIGGER_MODEL to an available model.", file=sys.stderr)
+        return 1
+
+    print(f"Processing {len(graves)} graves with model {model}...")
+    print()
+
+    # Process each grave with timing
+    llm_count = 0
+    fallback_count = 0
+    llm_times: list[float] = []
+    enriched_graves: list[EnrichedGrave] = []
+    total_start = time.perf_counter()
+
+    for i, grave in enumerate(graves, 1):
+        enriched, elapsed = _enrich_with_timeout(grave, model, timeout=60.0)
+        enriched_graves.append(enriched)
+
+        if grave.is_mass:
+            path_display = f"{len(grave.members)} files [MASS]"
+        else:
+            path_display = grave.path
+
+        source_display = enriched.source
+        if source_display == "llm":
+            llm_count += 1
+            llm_times.append(elapsed)
+        else:
+            fallback_count += 1
+
+        print(f"  {i:2d}. {path_display:<50} {source_display:8s} {elapsed:.2f}s")
+
+    total_elapsed = time.perf_counter() - total_start
+
+    print()
+    print(f"Totals: llm={llm_count} fallback={fallback_count} total_time={total_elapsed:.2f}s", end="")
+    if llm_times:
+        avg_llm = sum(llm_times) / len(llm_times)
+        print(f" avg_llm={avg_llm:.2f}s")
+    else:
+        print()
+
+    # Write output
+    output_path = Path(args.output)
+    try:
+        output_path.write_text(enriched_graves_to_json(enriched_graves), encoding="utf-8")
+        print(f"Wrote {len(enriched_graves)} enriched graves to {output_path}")
+    except OSError as e:
+        print(f"Error writing output: {e}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
