@@ -13,6 +13,7 @@ from gravedigger.exhume import Grave
 from gravedigger.llm import (
     EnrichedGrave,
     PROMPT_VERSION,
+    BANNED_WORDS,
     _build_fallback,
     _build_mass_grave_prompt,
     _build_prompt,
@@ -20,6 +21,7 @@ from gravedigger.llm import (
     _extract_json_object,
     _load_from_cache,
     _parse_model_output,
+    _quality_gate,
     _save_to_cache,
     _strip_thinking_blocks,
     enrich_grave_with_llm,
@@ -85,62 +87,70 @@ class TestParsing:
 
     def test_valid_json_parsed(self):
         raw = '{"epitaph": "RIP", "last_words": "Goodbye"}'
-        result = _parse_model_output(raw, "test.py")
+        result = _parse_model_output(raw, "test.py", "Remove module")
         assert result == ("RIP", "Goodbye")
 
     def test_json_in_code_fences(self):
         raw = '```json\n{"epitaph": "RIP", "last_words": "Goodbye"}\n```'
-        result = _parse_model_output(raw, "test.py")
+        result = _parse_model_output(raw, "test.py", "Remove module")
         assert result == ("RIP", "Goodbye")
 
     def test_json_in_code_fences_no_lang(self):
         raw = '```\n{"epitaph": "RIP", "last_words": "Goodbye"}\n```'
-        result = _parse_model_output(raw, "test.py")
+        result = _parse_model_output(raw, "test.py", "Remove module")
         assert result == ("RIP", "Goodbye")
 
     def test_thinking_block_before_json(self):
         raw = _wrap("Let me think...") + '\n{"epitaph": "RIP", "last_words": "Goodbye"}'
-        result = _parse_model_output(raw, "test.py")
+        result = _parse_model_output(raw, "test.py", "Remove module")
         assert result == ("RIP", "Goodbye")
 
     def test_thinking_block_with_newlines(self):
         raw = _wrap("reasoning\n  more") + '\n{"epitaph": "RIP", "last_words": "Goodbye"}'
-        result = _parse_model_output(raw, "test.py")
+        result = _parse_model_output(raw, "test.py", "Remove module")
         assert result == ("RIP", "Goodbye")
 
     def test_garbage_then_valid_json(self):
         raw = 'Some preamble text\n{"epitaph": "RIP", "last_words": "Goodbye"}\nTrailing'
-        result = _parse_model_output(raw, "test.py")
+        result = _parse_model_output(raw, "test.py", "Remove module")
         assert result == ("RIP", "Goodbye")
 
     def test_garbage_then_fallback(self):
         raw = 'No JSON here at all'
-        result = _parse_model_output(raw, "test.py")
+        result = _parse_model_output(raw, "test.py", "Remove module")
         assert result is None
 
     def test_missing_keys_fallback(self):
         raw = '{"epitaph": "Only one key"}'
-        result = _parse_model_output(raw, "test.py")
+        result = _parse_model_output(raw, "test.py", "Remove module")
         assert result is None
 
     def test_empty_strings_fallback(self):
         raw = '{"epitaph": "", "last_words": "   "}'
-        result = _parse_model_output(raw, "test.py")
+        result = _parse_model_output(raw, "test.py", "Remove module")
         assert result is None
 
     def test_epitaph_length_capped(self):
-        long_epitaph = "x" * 200
+        # Use epitaph between 120-160 chars: passes quality gate (160 limit) but gets capped at 120
+        long_epitaph = "x" * 140
         raw = f'{{"epitaph": "{long_epitaph}", "last_words": "Bye"}}'
-        result = _parse_model_output(raw, "test.py")
+        result = _parse_model_output(raw, "test.py", "Remove module")
         assert result is not None
         assert len(result[0]) <= 123  # 120 + "…"
 
-    def test_last_words_length_capped(self):
-        long_last = "y" * 300
+    def test_last_words_rejected_over_160_by_quality_gate(self):
+        # Quality gate rejects last_words > 160 chars
+        long_last = "y" * 161
         raw = f'{{"epitaph": "RIP", "last_words": "{long_last}"}}'
-        result = _parse_model_output(raw, "test.py")
-        assert result is not None
-        assert len(result[1]) <= 203  # 200 + "…"
+        result = _parse_model_output(raw, "test.py", "Remove module")
+        assert result is None  # rejected by quality gate
+
+    def test_epitaph_rejected_over_160_by_quality_gate(self):
+        # Quality gate rejects epitaph > 160 chars
+        long_epitaph = "x" * 161
+        raw = f'{{"epitaph": "{long_epitaph}", "last_words": "Bye"}}'
+        result = _parse_model_output(raw, "test.py", "Remove module")
+        assert result is None  # rejected by quality gate
 
     def test_strip_thinking_blocks(self):
         # Closed think block removed
@@ -171,32 +181,89 @@ class TestParsing:
         assert _extract_json_object('{invalid') is None
 
 
+class TestQualityGate:
+    """Tests for quality gate validation."""
+
+    def test_clean_output_passes(self):
+        result = _quality_gate("Old config, 12 years, dropped", "Twelve years of settings, gone.", "drop legacy support")
+        assert result is None
+
+    def test_rejects_last_words_echoing_death_message(self):
+        # last_words contains the exact death message (after normalization)
+        result = _quality_gate("Old config, 12 years, dropped", "They drop legacy support, how rude.", "drop legacy support")
+        assert result is not None
+        assert "echoes death message" in result
+
+    def test_rejects_banned_word_ghost(self):
+        result = _quality_gate("A ghost of a config", "I am a ghost now.", "drop legacy support")
+        assert result is not None
+        assert "Banned word" in result
+        assert "ghost" in result
+
+    def test_rejects_banned_word_void(self):
+        result = _quality_gate("Into the void it went", "Gone.", "drop legacy support")
+        assert result is not None
+        assert "void" in result
+
+    def test_rejects_banned_word_final_breath(self):
+        result = _quality_gate("Final breath of the config", "Gone.", "drop legacy support")
+        assert result is not None
+        assert "final breath" in result
+
+    def test_rejects_overlong_epitaph(self):
+        long_epitaph = "x" * 161
+        result = _quality_gate(long_epitaph, "Short last words.", "drop legacy support")
+        assert result is not None
+        assert "exceeds 160" in result
+
+    def test_rejects_overlong_last_words(self):
+        long_last = "y" * 161
+        result = _quality_gate("Short epitaph.", long_last, "drop legacy support")
+        assert result is not None
+        assert "exceeds 160" in result
+
+    def test_case_insensitive_banned_words(self):
+        result = _quality_gate("A GHOST appears", "Gone.", "drop legacy support")
+        assert result is not None
+        assert "ghost" in result
+
+    def test_death_message_punctuation_stripped(self):
+        # death message with punctuation should still be detected when last_words has exact match
+        result = _quality_gate("Old config", "They remove legacy support!", "remove legacy support")
+        assert result is not None
+        assert "echoes death message" in result
+
+
 class TestPromptBuilding:
     """Tests for prompt construction."""
 
     def test_single_grave_prompt_contains_key_fields(self):
-        grave = _make_grave()
+        grave = _make_grave(lifespan_days=4380, lines_at_death=56)  # ~12 years
         prompt = _build_prompt(grave)
         assert grave.path in prompt
-        assert str(grave.lifespan_days) in prompt
-        assert str(grave.lines_at_death) in prompt
-        assert grave.killer in prompt
-        assert grave.death_message in prompt
+        assert "12 years" in prompt or "4380 days" in prompt
+        assert "56 lines" in prompt
+        assert "2024" in prompt  # death year
+        assert "Remove module" in prompt
         assert "QUOTED DATA" in prompt
         assert '"""' in prompt
         assert "STRICT JSON" in prompt
+        assert "BANNED words" in prompt
+        assert "12 words" in prompt
+        assert "8-20 words" in prompt
+        assert "EXAMPLES" in prompt
 
     def test_mass_grave_prompt_mentions_group(self):
-        grave = _make_mass_grave()
+        grave = _make_mass_grave(lifespan_days=2920)  # ~8 years
         prompt = _build_mass_grave_prompt(grave)
         assert "MASS GRAVE" in prompt
         assert str(len(grave.members)) in prompt
         assert "File count" in prompt
         assert "Members" in prompt
-        for member in grave.members[:3]:
-            assert member in prompt
         assert "QUOTED DATA" in prompt
         assert "STRICT JSON" in prompt
+        assert "BANNED words" in prompt
+        assert "EXAMPLE" in prompt
 
     def test_snippet_truncated_in_prompt(self):
         long_snippet = "x" * 2000
@@ -216,6 +283,9 @@ class TestPromptBuilding:
         assert data_start != -1 and data_end != -1 and data_end > data_start
         data_block = prompt[data_start:data_end]
         assert "ignore previous instructions" in data_block
+
+    def test_prompt_version_changed(self):
+        assert PROMPT_VERSION == 2
 
 
 class TestFallback:
@@ -310,7 +380,7 @@ class TestCache:
         grave = _make_grave()
         key1 = _cache_key(grave, "model-a")
         # Manually test with different version
-        with patch("gravedigger.llm.PROMPT_VERSION", 2):
+        with patch("gravedigger.llm.PROMPT_VERSION", 999):
             key2 = _cache_key(grave, "model-a")
         assert key1 != key2
 
