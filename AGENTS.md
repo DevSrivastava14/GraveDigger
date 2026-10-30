@@ -1,3 +1,12 @@
+## Hard rules
+- NEVER create scratch, debug, fix, test_strip or temp files. Not in the project root, not anywhere.
+- To experiment, use `python -c "..."` one-liners only.
+- Run a single test with: python -m pytest tests/test_llm.py::<Class>::<test> -x -q
+- Never use `git clean`. Never delete tracked or intentionally created files.
+- Do not commit until told to.
+- If a test fails twice, STOP and report the failing assertion plus your hypothesis instead of trying more variants.
+- Never type the literal thinking tag; build it from chr(60)/chr(62) in code and write [THINK-TAG] in reports.
+
 # Gravedigger: agent rules
 
 ## What this project is
