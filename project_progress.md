@@ -66,6 +66,12 @@
 - 30-graves flask run: ~14.8s/grave; cache did not persist; about 10/30 had quality issues (invented numbers, contradictory last_words)
 - Committed as 110ef60
 
+### Day 2 (continued)
+- Implemented fixes from task: numberless prompt (only filename, extension, commit message, last snippet capped at 15 lines/800 chars, 2 few-shot examples), stricter quality gate (epitaph <= 25 words, last_words <= 12 words, rejects foreign path-like tokens), absolute cache dir (Path.home()/.gravedigger_cache, logged at startup), speed logging (prompt_eval_count, eval_count, total_duration, thinking field non-empty check)
+- Updated tests to match new prompt structure and cache path; all 104 tests pass
+- Committed as f07e699
+- 30-grave flask verification pending (user to run)
+
 ## Known issues (deliberately deferred)
 - flask.py (founding file) ranks 93/205 and is not in the top 30; founder bonus alone was not enough.
 - Boilerplate files (LICENSE, AUTHORS, Makefile, tox.ini...) take ~10 slots in the top 30.
