@@ -304,14 +304,13 @@ class TestPromptBuilding:
         grave = _make_grave(lifespan_days=4380, lines_at_death=56)  # ancient, small
         prompt = _build_prompt(grave)
         assert grave.path in prompt
-        assert "Kind:" in prompt
-        assert "Age: ancient (over 10 years)" in prompt
-        assert "Size: small (under 100 lines)" in prompt
+        assert "Filename:" in prompt
+        assert "Extension: .py" in prompt
+        assert "Death message" in prompt
+        assert "Last snippet" in prompt
         assert "QUOTED DATA" in prompt
         assert '"""' in prompt
         assert "NO digits" in prompt
-        assert "6-12 words" in prompt
-        assert "6-16 words" in prompt
         assert "EXAMPLES" in prompt
         # Should NOT contain raw numbers
         assert "4380" not in prompt
@@ -321,10 +320,11 @@ class TestPromptBuilding:
     def test_mass_grave_prompt_contains_qualitative_bands(self):
         grave = _make_mass_grave(lifespan_days=2920)  # old
         prompt = _build_mass_grave_prompt(grave)
-        assert "Group:" in prompt
-        assert "Age: old (6-10 years)" in prompt
+        assert "Directory:" in prompt
+        assert "Files:" in prompt
+        assert "Death message" in prompt
+        assert "Representative snippet" in prompt
         assert "NO digits" in prompt
-        assert "6-12 words" in prompt
         assert "EXAMPLE" in prompt
         # Should NOT contain raw numbers
         assert "5 files" not in prompt
@@ -415,12 +415,12 @@ class TestCache:
 
     def setup_method(self):
         # Clean cache dir before each test
-        cache_dir = Path(".gravedigger_cache")
+        cache_dir = Path.home() / ".gravedigger_cache"
         if cache_dir.exists():
             shutil.rmtree(cache_dir)
 
     def teardown_method(self):
-        cache_dir = Path(".gravedigger_cache")
+        cache_dir = Path.home() / ".gravedigger_cache"
         if cache_dir.exists():
             shutil.rmtree(cache_dir)
 
@@ -482,12 +482,12 @@ class TestEnrichSingle:
     """Tests for enrich_grave_with_llm with mocked Ollama."""
 
     def setup_method(self):
-        cache_dir = Path(".gravedigger_cache")
+        cache_dir = Path.home() / ".gravedigger_cache"
         if cache_dir.exists():
             shutil.rmtree(cache_dir)
 
     def teardown_method(self):
-        cache_dir = Path(".gravedigger_cache")
+        cache_dir = Path.home() / ".gravedigger_cache"
         if cache_dir.exists():
             shutil.rmtree(cache_dir)
 
@@ -588,19 +588,20 @@ class TestEnrichSingle:
         call_args = mock_ollama.chat.call_args
         prompt = call_args[1]["messages"][0]["content"]
         assert "MASS GRAVE" in prompt
-        assert "Group:" in prompt
+        assert "Directory:" in prompt
+        assert "Files:" in prompt
 
 
 class TestEnrichMultiple:
     """Tests for enrich_graves_with_llm (batch)."""
 
     def setup_method(self):
-        cache_dir = Path(".gravedigger_cache")
+        cache_dir = Path.home() / ".gravedigger_cache"
         if cache_dir.exists():
             shutil.rmtree(cache_dir)
 
     def teardown_method(self):
-        cache_dir = Path(".gravedigger_cache")
+        cache_dir = Path.home() / ".gravedigger_cache"
         if cache_dir.exists():
             shutil.rmtree(cache_dir)
 
@@ -731,12 +732,12 @@ class TestOllamaCallArguments:
     """Tests that ollama.chat is called with correct arguments."""
 
     def setup_method(self):
-        cache_dir = Path(".gravedigger_cache")
+        cache_dir = Path.home() / ".gravedigger_cache"
         if cache_dir.exists():
             shutil.rmtree(cache_dir)
 
     def teardown_method(self):
-        cache_dir = Path(".gravedigger_cache")
+        cache_dir = Path.home() / ".gravedigger_cache"
         if cache_dir.exists():
             shutil.rmtree(cache_dir)
 
