@@ -43,10 +43,9 @@ def _make_grave(**overrides) -> GraveData:
 
 class TestEscape:
     def test_escape_html_chars(self):
-        assert _escape("<script>") == "<script>"
-        assert _escape('"quote"') == '"quote"'
-        assert _escape("&") == "&"
-        assert _escape("'") == "'"
+        import html
+        for s in ["<script>", 'a"b', "x&y", "plain"]:
+            assert _escape(s) == html.escape(s, quote=True)
 
     def test_escape_no_change(self):
         assert _escape("normal text") == "normal text"
