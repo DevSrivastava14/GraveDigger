@@ -72,6 +72,18 @@
 - Committed as f07e699
 - 30-grave flask verification pending (user to run)
 
+### Day 2/3
+- Created gravedigger/render.py with render_html(graves) -> self-contained HTML string (inline CSS+JS, no CDN, no external fonts)
+- Theme: spooky night graveyard with Noche de Muertos toggle (marigold, papel picado, candles); choice persisted in localStorage
+- Tombstones: scattered layout (seeded random), varied shapes/sizes/tilt by notability; mass graves get wide stones
+- Click/tap/Enter/Space opens card with epitaph, last_words, ENGRAVED FACTS (born/died, lifespan, lines, killer+message, snippet in <pre>); close on Esc/click outside
+- Header stats: graves shown, total lines buried, longest life, deadliest year
+- All repo-derived strings HTML-escaped; prefers-reduced-motion respected; keyboard accessible (buttons, focus trap)
+- Updated cli.py: `gravedigger <repo> -o graveyard.html [--model M] [--no-llm] [--cache-dir D] [--limit 30]` runs exhume -> epitaphs (fallback when --no-llm) -> render; --json still works
+- Created tests/test_render.py with 28 tests (HTML escaping, reduced motion, theme vars, tombstones, cards, stable layout, JSON loading)
+- Rendered epitaphs.json to test_graveyard.html (30 graves, ~150KB); verified no external resource URLs (grep for http)
+- Committed as e7e1909
+
 ## Known issues (deliberately deferred)
 - flask.py (founding file) ranks 93/205 and is not in the top 30; founder bonus alone was not enough.
 - Boilerplate files (LICENSE, AUTHORS, Makefile, tox.ini...) take ~10 slots in the top 30.
